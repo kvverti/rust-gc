@@ -419,11 +419,11 @@ fn collect_garbage(st: &mut GcState) {
         this: NonNull<GcBox<dyn Trace>>,
     }
     unsafe fn mark<'a>(
-        eph_nodes: &[NonNull<GcBox<EphemeronData<dyn Trace>>>],
+        eph_nodes: &mut Vec<NonNull<GcBox<EphemeronData<dyn Trace>>>>,
         head: &'a Cell<Option<NonNull<GcBox<dyn Trace>>>>,
     ) -> Vec<Unmarked<'a>> {
         // first, mark all ephemeron keys
-        for node in eph_nodes {
+        for node in &*eph_nodes {
             node.as_ref().header.mark_eph_key();
         }
         // Walk the tree, tracing and marking the nodes
@@ -438,11 +438,25 @@ fn collect_garbage(st: &mut GcState) {
 
         // Next, walk the tree of ephemerons. These were not marked during the previous
         // loop by virtue of ephemerons' empty trace() impl.
-        for node in eph_nodes {
+        for node in &*eph_nodes {
             if node.as_ref().header.roots() > 0 {
                 node.as_ref().trace_ephemeron_inner();
             }
         }
+
+        // clear ephemerons without strongly reachable keys
+        // the cleared values will be finalized and reclaimed in future GC cycles
+        eph_nodes.retain_mut(|node| match node.as_ref().data.key {
+            None => false,
+            Some(key) => {
+                if key.as_ref().header.is_marked_strongly_reachable() {
+                    true
+                } else {
+                    node.as_mut().data.clear();
+                    false
+                }
+            }
+        });
 
         // Collect a vector of all of the nodes which were not marked,
         // and unmark the ones which were.
@@ -450,14 +464,6 @@ fn collect_garbage(st: &mut GcState) {
         let mut unmark_head = head;
         while let Some(node) = unmark_head.get() {
             if node.as_ref().header.is_marked_reachable() {
-                if !node.as_ref().header.is_marked_strongly_reachable() {
-                    // treat weakly reachable nodes as unmarked for the
-                    // purpose of finalization
-                    unmarked.push(Unmarked {
-                        incoming: unmark_head,
-                        this: node,
-                    });
-                }
                 node.as_ref().header.unmark();
             } else {
                 unmarked.push(Unmarked {
@@ -487,27 +493,14 @@ fn collect_garbage(st: &mut GcState) {
 
     unsafe {
         let head = Cell::from_mut(&mut st.boxes_start);
-        let unmarked = mark(&st.ephemeron_boxes, head);
+        let unmarked = mark(&mut st.ephemeron_boxes, head);
         if unmarked.is_empty() {
             return;
         }
-        // clear ephemerons without strongly reachable keys
-        st.ephemeron_boxes
-            .retain_mut(|node| match node.as_ref().data.key {
-                None => false,
-                Some(key) => {
-                    if key.as_ref().header.is_marked_strongly_reachable() {
-                        true
-                    } else {
-                        node.as_mut().data.clear();
-                        false
-                    }
-                }
-            });
         for node in &unmarked {
             Trace::finalize_glue(&node.this.as_ref().data);
         }
-        mark(&st.ephemeron_boxes, head);
+        mark(&mut st.ephemeron_boxes, head);
         sweep(unmarked, &mut st.stats.bytes_allocated);
     }
 }
