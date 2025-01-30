@@ -31,6 +31,7 @@ mod gc;
 mod serde;
 mod trace;
 
+use gc::EphemeronData;
 #[cfg(feature = "derive")]
 pub use gc_derive::{Finalize, Trace};
 
@@ -79,6 +80,24 @@ impl<T: Trace> Gc<T> {
     /// ```
     pub fn new(value: T) -> Self {
         unsafe { Gc::from_gcbox(GcBox::new(value)) }
+    }
+
+    pub fn downgrade(this: Self) -> Weak<T> {
+        Weak {
+            data: EphemeronData::from_key_value(
+                unsafe { NonNull::new_unchecked(this.inner_ptr()) },
+                this,
+            ),
+        }
+    }
+
+    pub fn downgrade_with_key<K: Trace>(this: Self, key: &Gc<K>) -> Weak<T> {
+        Weak {
+            data: EphemeronData::from_key_value(
+                unsafe { NonNull::new_unchecked(key.inner_ptr()) },
+                this,
+            ),
+        }
     }
 }
 
@@ -256,6 +275,16 @@ unsafe impl<T: Trace + ?Sized> Trace for Gc<T> {
     }
 
     #[inline]
+    unsafe fn trace_ephemeron(&self) {
+        self.inner().trace_ephemeron_inner();
+    }
+
+    #[inline]
+    unsafe fn trace_weak(&self) {
+        self.inner().trace_weak_inner();
+    }
+
+    #[inline]
     unsafe fn root(&self) {
         assert!(!self.rooted(), "Can't double-root a Gc<T>");
 
@@ -425,6 +454,55 @@ impl<T: ?Sized> std::convert::AsRef<T> for Gc<T> {
         self
     }
 }
+
+//////////
+// Weak //
+//////////
+
+/// A weak reference to data of type `T`.
+pub struct Weak<T: ?Sized + 'static> {
+    data: Gc<EphemeronData<T>>,
+}
+
+impl<T: Trace> Weak<T> {
+    pub fn with_key<K: Trace>(key: &Gc<K>, value: T) -> Self {
+        Gc::downgrade_with_key(Gc::new(value), key)
+    }
+
+    pub fn new(value: T) -> Self {
+        Gc::downgrade(Gc::new(value))
+    }
+}
+
+impl<T: Trace + ?Sized> Weak<T> {
+    pub fn upgrade(&self) -> Option<Gc<T>> {
+        self.data.value()
+    }
+}
+
+impl<T: ?Sized + 'static> Finalize for Weak<T> {}
+
+unsafe impl<T: Trace + ?Sized> Trace for Weak<T> {
+    custom_trace!(this, {
+        mark(&this.data);
+    });
+}
+
+impl<T: ?Sized + 'static> Clone for Weak<T> {
+    fn clone(&self) -> Self {
+        Self {
+            data: self.data.clone(),
+        }
+    }
+}
+
+impl<T: ?Sized + 'static> PartialEq for Weak<T> {
+    fn eq(&self, other: &Self) -> bool {
+        self.data == other.data
+    }
+}
+
+impl<T: ?Sized + 'static> Eq for Weak<T> {}
 
 ////////////
 // GcCell //
