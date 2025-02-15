@@ -83,20 +83,22 @@ impl<T: Trace> Gc<T> {
     }
 
     pub fn downgrade(this: Self) -> Weak<T> {
-        Weak {
-            data: EphemeronData::from_key_value(
-                unsafe { NonNull::new_unchecked(this.inner_ptr()) },
-                this,
-            ),
+        unsafe {
+            let this_ptr = NonNull::new_unchecked(ManuallyDrop::new(this).inner_ptr());
+            Weak {
+                data: EphemeronData::from_key_value(this_ptr, this_ptr),
+            }
         }
     }
 
     pub fn downgrade_with_key<K: Trace>(this: Self, key: &Gc<K>) -> Weak<T> {
-        Weak {
-            data: EphemeronData::from_key_value(
-                unsafe { NonNull::new_unchecked(key.inner_ptr()) },
-                this,
-            ),
+        unsafe {
+            Weak {
+                data: EphemeronData::from_key_value(
+                    NonNull::new_unchecked(key.inner_ptr()),
+                    NonNull::new_unchecked(ManuallyDrop::new(this).inner_ptr()),
+                ),
+            }
         }
     }
 }
@@ -272,11 +274,6 @@ unsafe impl<T: Trace + ?Sized> Trace for Gc<T> {
     #[inline]
     unsafe fn trace(&self) {
         self.inner().trace_inner();
-    }
-
-    #[inline]
-    unsafe fn trace_ephemeron(&self) {
-        self.inner().trace_ephemeron_inner();
     }
 
     #[inline]
@@ -476,7 +473,9 @@ impl<T: Trace> Weak<T> {
 
 impl<T: Trace + ?Sized> Weak<T> {
     pub fn upgrade(&self) -> Option<Gc<T>> {
-        self.data.value()
+        self.data
+            .value()
+            .map(|bx| unsafe { Gc::from_raw(GcBox::value_ptr(bx.as_ptr())) })
     }
 }
 

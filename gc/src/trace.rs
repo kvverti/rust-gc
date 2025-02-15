@@ -27,13 +27,6 @@ pub unsafe trait Trace: Finalize {
     /// Strongly all contained `Gc`s.
     unsafe fn trace(&self);
 
-    /// Either weakly or strongly marks contained `Gc` allocations.
-    /// The default implementation strongly marks, which is always safe
-    /// but may be overly conservative.
-    unsafe fn trace_ephemeron(&self) {
-        self.trace();
-    }
-
     /// Weakly marks all contained `Gc` allocations.
     /// The default implementation strongly marks, which is always safe
     /// but may be overly conservative.
@@ -61,8 +54,6 @@ macro_rules! unsafe_empty_trace {
         #[inline]
         unsafe fn trace(&self) {}
         #[inline]
-        unsafe fn trace_ephemeron(&self) {}
-        #[inline]
         unsafe fn trace_weak(&self) {}
         #[inline]
         unsafe fn root(&self) {}
@@ -88,15 +79,6 @@ macro_rules! custom_trace {
             #[inline]
             unsafe fn mark<T: $crate::Trace + ?Sized>(it: &T) {
                 $crate::Trace::trace(it);
-            }
-            let $this = self;
-            $body
-        }
-        #[inline]
-        unsafe fn trace_ephemeron(&self) {
-            #[inline]
-            unsafe fn mark<T: $crate::Trace + ?Sized>(it: &T) {
-                $crate::Trace::trace_ephemeron(it);
             }
             let $this = self;
             $body

@@ -2,7 +2,7 @@ use crate::trace::Trace;
 use crate::{set_data_ptr, Finalize, Gc};
 use std::alloc::{alloc, dealloc, Layout};
 use std::cell::{Cell, RefCell};
-use std::mem::{self, ManuallyDrop};
+use std::mem;
 use std::ptr::{self, NonNull};
 
 #[cfg(feature = "nightly")]
@@ -12,7 +12,7 @@ struct GcState {
     stats: GcStats,
     config: GcConfig,
     boxes_start: Option<NonNull<GcBox<dyn Trace>>>,
-    ephemeron_boxes: Vec<NonNull<GcBox<EphemeronData<dyn Trace>>>>,
+    ephemeron_boxes: Vec<NonNull<Option<EphemeronKey>>>,
 }
 
 impl Drop for GcState {
@@ -54,17 +54,14 @@ thread_local!(static GC_STATE: RefCell<GcState> = RefCell::new(GcState {
 }));
 
 /// The high bits of a usize counter that are used during the mark phase.
-const MARK_MASK: usize = STRONG_MASK | WEAK_MASK | EPHEMERON_KEY_MASK;
+const MARK_MASK: usize = STRONG_MASK | WEAK_MASK;
 /// The bit used to mark strong reachability.
 const STRONG_MASK: usize = 1 << (usize::BITS - 1);
 /// The bit used to mark weak reachability.
 const WEAK_MASK: usize = 1 << (usize::BITS - 2);
-/// The bit used to mark an ephemeron key.
-const EPHEMERON_KEY_MASK: usize = 1 << (usize::BITS - 3);
 /// The bits used to store the root count. Remaining bits that are not used to mark.
 const ROOTS_MASK: usize = !MARK_MASK;
 /// The maximum allowed number of concurrent roots.
-/// This is at least 2^13 (8,192).
 const ROOTS_MAX: usize = ROOTS_MASK;
 
 pub(crate) struct GcBoxHeader {
@@ -110,11 +107,6 @@ impl GcBoxHeader {
     }
 
     #[inline]
-    pub fn is_marked_eph_key(&self) -> bool {
-        self.roots.get() & EPHEMERON_KEY_MASK != 0
-    }
-
-    #[inline]
     pub fn is_marked_strongly_reachable(&self) -> bool {
         self.roots.get() & STRONG_MASK != 0
     }
@@ -127,11 +119,6 @@ impl GcBoxHeader {
     #[inline]
     pub fn mark_weak(&self) {
         self.roots.set(self.roots.get() | WEAK_MASK);
-    }
-
-    #[inline]
-    pub fn mark_eph_key(&self) {
-        self.roots.set(self.roots.get() | EPHEMERON_KEY_MASK);
     }
 
     #[inline]
@@ -267,20 +254,6 @@ impl<T: Trace + ?Sized> GcBox<T> {
         }
     }
 
-    /// Marks this `GcBox` and its data depending on whether this
-    /// holds an ephemeron key.
-    pub(crate) unsafe fn trace_ephemeron_inner(&self) {
-        if !self.header.is_marked_reachable() {
-            if self.header.is_marked_eph_key() {
-                // if this is a key, mark it weak
-                self.header.mark_weak();
-            } else {
-                self.header.mark_strong();
-            }
-            self.data.trace_ephemeron();
-        }
-    }
-
     /// Weakly marks this `GcBox` and data.
     pub(crate) unsafe fn trace_weak_inner(&self) {
         if !self.header.is_marked_reachable() {
@@ -314,49 +287,48 @@ impl<T: ?Sized> GcBox<T> {
     }
 }
 
-/// Internal representation of an ephemeron. This is a struct
-/// and not an enum so that it can be unsized.
+struct EphemeronKey(NonNull<GcBox<dyn Trace>>);
+
+/// Internal representation of an ephemeron.
+/// The key is not structurally rooted - it never participates in reachability analysis.
+/// The value is structurally rooted, as normal for a GC field.
+#[repr(C)] // required to access `key` as a prefix
 pub(crate) struct EphemeronData<T: ?Sized + 'static> {
-    // invariant: `value` is a valid `Gc` iff `key` is Some
-    key: Option<NonNull<GcBox<dyn Trace>>>,
-    value: *const T,
+    key: Option<EphemeronKey>,
+    value: NonNull<GcBox<T>>,
 }
 
 impl<T: ?Sized + 'static> EphemeronData<T> {
     /// Clears the data out of this ephemeron.
     /// Note that this doesn't reclaim the key or value.
     fn clear(&mut self) {
-        unsafe {
-            if self.key.take().is_some() {
-                Gc::from_raw(self.value);
-            }
-        }
+        self.key = None;
     }
 
-    /// Retrieves the value of the ephemeron if it is present.
-    pub(crate) fn value(&self) -> Option<Gc<T>> {
-        if self.key.is_some() {
-            let gc = unsafe { ManuallyDrop::new(Gc::from_raw(self.value)) };
-            Some(ManuallyDrop::into_inner(gc.clone()))
-        } else {
-            None
-        }
+    pub(crate) fn value(&self) -> Option<NonNull<GcBox<T>>> {
+        self.key.as_ref().map(|_| self.value)
     }
 }
 
-impl<T: Trace> EphemeronData<T> {
-    pub(crate) fn from_key_value(key: NonNull<GcBox<dyn Trace>>, value: Gc<T>) -> Gc<Self> {
-        let gc = Gc::new(Self {
-            key: Some(key),
-            value: Gc::into_raw(value),
+impl<T: Trace + ?Sized> EphemeronData<T> {
+    /// Safety: both `key` and `value` refer to GcBoxes contained within a Gc. The key must be
+    /// borrowed while the value must be owned (and rooted).
+    pub(crate) unsafe fn from_key_value(
+        key: NonNull<GcBox<dyn Trace>>,
+        value: NonNull<GcBox<T>>,
+    ) -> Gc<Self> {
+        let gcbox = GcBox::new(Self {
+            key: Some(EphemeronKey(key)),
+            value,
         });
         // IMPORTANT! Every ephemeron constructed is added to this list.
         GC_STATE.with(|st| {
             let mut st = st.borrow_mut();
-            st.ephemeron_boxes
-                .push(unsafe { NonNull::new_unchecked(gc.inner_ptr() as _) });
+            st.ephemeron_boxes.push(unsafe {
+                NonNull::new_unchecked(ptr::addr_of_mut!((*gcbox.as_ptr()).data.key))
+            });
         });
-        gc
+        Gc::from_gcbox(gcbox)
     }
 }
 
@@ -370,31 +342,25 @@ impl<T: Trace + ?Sized> Finalize for EphemeronData<T> {}
 
 unsafe impl<T: Trace + ?Sized> Trace for EphemeronData<T> {
     unsafe fn trace(&self) {
-        // this method intentionally left blank
-        // tracing of ephemerons is done in a separate pass
-    }
-
-    unsafe fn trace_ephemeron(&self) {
-        if let Some(value) = self.value() {
-            Trace::trace_ephemeron(&value)
-        }
+        // ephemeron data is always counted as weak
+        self.trace_weak();
     }
 
     unsafe fn trace_weak(&self) {
         if let Some(value) = self.value() {
-            Trace::trace_weak(&value);
+            value.as_ref().trace_weak_inner()
         }
     }
 
     unsafe fn root(&self) {
         if let Some(value) = self.value() {
-            Trace::root(&value);
+            value.as_ref().root_inner()
         }
     }
 
     unsafe fn unroot(&self) {
         if let Some(value) = self.value() {
-            Trace::unroot(&value);
+            value.as_ref().unroot_inner()
         }
     }
 
@@ -406,7 +372,7 @@ unsafe impl<T: Trace + ?Sized> Trace for EphemeronData<T> {
 impl<T: ?Sized + 'static> PartialEq for EphemeronData<T> {
     fn eq(&self, other: &Self) -> bool {
         // compare using addresses (identity), as we can't guarantee the pointers point to valid data
-        std::ptr::addr_eq(self.value, other.value)
+        ptr::eq(self, other)
     }
 }
 
@@ -419,13 +385,9 @@ fn collect_garbage(st: &mut GcState) {
         this: NonNull<GcBox<dyn Trace>>,
     }
     unsafe fn mark<'a>(
-        eph_nodes: &mut Vec<NonNull<GcBox<EphemeronData<dyn Trace>>>>,
+        eph_nodes: &mut Vec<NonNull<Option<EphemeronKey>>>,
         head: &'a Cell<Option<NonNull<GcBox<dyn Trace>>>>,
     ) -> Vec<Unmarked<'a>> {
-        // first, mark all ephemeron keys
-        for node in &*eph_nodes {
-            node.as_ref().header.mark_eph_key();
-        }
         // Walk the tree, tracing and marking the nodes
         let mut mark_head = head.get();
         while let Some(node) = mark_head {
@@ -436,23 +398,15 @@ fn collect_garbage(st: &mut GcState) {
             mark_head = node.as_ref().header.next.get();
         }
 
-        // Next, walk the tree of ephemerons. These were not marked during the previous
-        // loop by virtue of ephemerons' empty trace() impl.
-        for node in &*eph_nodes {
-            if node.as_ref().header.roots() > 0 {
-                node.as_ref().trace_ephemeron_inner();
-            }
-        }
-
         // clear ephemerons without strongly reachable keys
         // the cleared values will be finalized and reclaimed in future GC cycles
-        eph_nodes.retain_mut(|node| match node.as_ref().data.key {
+        eph_nodes.retain_mut(|node| match node.as_ref() {
             None => false,
             Some(key) => {
-                if key.as_ref().header.is_marked_strongly_reachable() {
+                if key.0.as_ref().header.is_marked_strongly_reachable() {
                     true
                 } else {
-                    node.as_mut().data.clear();
+                    *node.as_mut() = None;
                     false
                 }
             }
