@@ -24,6 +24,14 @@ fn derive_trace(mut s: Structure<'_>) -> proc_macro2::TokenStream {
                 }
                 match *self { #trace_body }
             }
+            #[inline] unsafe fn trace_weak(&self) {
+                #[allow(dead_code)]
+                #[inline]
+                unsafe fn mark<T: ::gc::Trace + ?Sized>(it: &T) {
+                    ::gc::Trace::trace_weak(it);
+                }
+                match *self { #trace_body }
+            }
             #[inline] unsafe fn root(&self) {
                 #[allow(dead_code)]
                 #[inline]

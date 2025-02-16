@@ -299,12 +299,6 @@ pub(crate) struct EphemeronData<T: ?Sized + 'static> {
 }
 
 impl<T: ?Sized + 'static> EphemeronData<T> {
-    /// Clears the data out of this ephemeron.
-    /// Note that this doesn't reclaim the key or value.
-    fn clear(&mut self) {
-        self.key = None;
-    }
-
     pub(crate) fn value(&self) -> Option<NonNull<GcBox<T>>> {
         self.key.as_ref().map(|_| self.value)
     }
@@ -329,12 +323,6 @@ impl<T: Trace + ?Sized> EphemeronData<T> {
             });
         });
         Gc::from_gcbox(gcbox)
-    }
-}
-
-impl<T: ?Sized + 'static> Drop for EphemeronData<T> {
-    fn drop(&mut self) {
-        self.clear();
     }
 }
 

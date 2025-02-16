@@ -475,7 +475,11 @@ impl<T: Trace + ?Sized> Weak<T> {
     pub fn upgrade(&self) -> Option<Gc<T>> {
         self.data
             .value()
-            .map(|bx| unsafe { Gc::from_raw(GcBox::value_ptr(bx.as_ptr())) })
+            .map(|bx| unsafe {
+                // increment root count as we're creating a new Gc
+                bx.as_ref().root_inner();
+                Gc::from_raw(GcBox::value_ptr(bx.as_ptr()))
+            })
     }
 }
 
